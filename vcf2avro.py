@@ -33,11 +33,15 @@ from __future__ import division
 
 import os
 import sys
+import time
 import shutil 
 import argparse
 import tempfile
 
 import avro
+import avro.io
+import avro.schema
+import avro.datafile
 
 # VCF Fixed columns
 
@@ -89,7 +93,148 @@ FLAG = b"Flag"
 CHARACTER = b"Character"
 STRING = b"String"
 
-class VCFReader(object):
+VARIABLE_SIZE = 0 
+
+class ProgressMonitor(object):
+    """
+    Class representing a progress monitor for a terminal based interface.
+    """
+    def __init__(self, total, units):
+        self.__total = total
+        self.__units = units
+        self.__progress_width = 40
+        self.__bar_index = 0
+        self.__bars = "/-\\|"
+        self.__start_time = time.clock()
+
+    def update(self, processed):
+        """
+        Updates this progress monitor to display the specified number 
+        of processed items.
+        """
+        complete = processed / self.__total
+        filled = int(complete * self.__progress_width)
+        spaces = self.__progress_width - filled 
+        bar = self.__bars[self.__bar_index]
+        self.__bar_index = (self.__bar_index + 1) % len(self.__bars)
+        elapsed = max(1, time.clock() - self.__start_time)
+        rate = processed / elapsed
+        s = '\r[{0}{1}] {2:5.1f}% @{3:8.1E} {4}/s {5}'.format('#' * filled, 
+            ' ' * spaces, complete * 100, rate, self.__units, bar)
+        sys.stdout.write(s)
+        sys.stdout.flush()
+         
+    def finish(self):
+        """
+        Completes the progress monitor.
+        """
+        print()
+
+
+
+class FileReader(object):
+    """
+    A class for reading data files from a variety of sources and 
+    with progress updating.
+    """
+    def __init__(self, in_file):
+        if in_file == '-':
+            self.__input_file = sys.stdin
+            if sys.version_info[:2] >= (3, 1):
+                try:
+                    self.__input_file = sys.stdin.buffer
+                except AttributeError:
+                    # When we're testing, we replace stdin with an ordinary
+                    # file. This does not support buffer, but is also not 
+                    # needed so we can skip this step
+                    pass
+            self.__progress_monitor = None
+            self.__input_file_size = None
+            self.__progress_file = None
+        else:
+            if in_file.endswith(".gz"):
+                # Detect broken GZIP handling in 2.7/3.2 and others and abort
+                # TODO this has been fixed upstream and can be removed at 
+                # some point.
+                f = gzip.open(in_file, "rb")
+                try:
+                    s = f.readline()
+                except Exception as e:
+                    print(BROKEN_GZIP_MESSAGE)
+                    sys.exit(1)
+                f.close() 
+                # Carry on as before
+                self.__input_file = gzip.open(in_file, "rb")
+                self.__progress_file = self.__input_file.fileobj
+            else:
+                self.__input_file = open(in_file, "rb")
+                self.__progress_file = self.__input_file 
+            statinfo = os.stat(in_file)
+            self.__input_file_size = statinfo.st_size 
+        self.__progress_update_rows = 2**32 
+        self.__progress_monitor = None
+
+    def get_progress_update_rows(self):
+        """
+        Returns the number of rows after which we should update the progress 
+        monitor.
+        """
+        return self.__progress_update_rows
+
+    def set_progress_update_rows(self, update_rows):
+        """
+        Sets the number of rows after which we should update progress 
+        to the specified value.
+        """
+        self.__progress_update_rows = update_rows
+
+    def get_input_file(self):
+        """
+        Returns the File object that is the source of the information 
+        in this reader.
+        """
+        return self.__input_file
+
+    def set_progress(self, progress):
+        """
+        If progress is True turn on progress monitoring for this GTF reader.
+        """
+        if progress:
+            self.__progress_monitor = ProgressMonitor(self.__input_file_size, 
+                    "bytes")
+            self.__progress_monitor.update(0)
+            self.__progress_update_rows = 100
+            if self.__input_file_size > 2**30:
+                self.__progress_update_rows = 1000
+    
+    def update_progress(self):
+        """
+        Reads the position we are at in the underlying file and uses this to 
+        update the progress bar, if used.
+        """
+        if self.__progress_monitor is not None:
+            t = self.__progress_file.tell() 
+            self.__progress_monitor.update(t)
+
+    def finish_progress(self):
+        """
+        Finishes up the progress monitor, if in use.
+        """ 
+        if self.__progress_monitor is not None:
+            self.update_progress()
+            self.__progress_monitor.finish()
+
+    def close(self):
+        """
+        Closes any open files on this Reader.
+        """
+        self.__input_file.close()
+        if self.__progress_file is not None: 
+            self.__progress_file.close()
+
+ 
+
+class VCFReader(FileReader):
     """
     A class for reading VCF files. 
     """
@@ -122,7 +267,58 @@ class VCFReader(object):
         """
         self.__genotypes = s.split()[9:]
 
-    def add_column(self, table, prefix, line):
+    def _get_converter(self, avro_type, num_elements):
+        """
+        Returns a conversion function for the specified type and number 
+        of elements.
+        """
+        d = {"boolean":int, "int": int, "float": float, "bytes": None}
+        if num_elements == 1:
+            f = d[avro_type]
+        else:
+            g = d[avro_type] 
+            def conv(s):
+                ret = []
+                for tok in s.split(","):
+                    ret.append(g(tok))
+                return ret
+            if g is None:
+                f = None
+            else:
+                f = conv
+        return f
+
+    def add_column_definition(self, name, description, avro_type, num_elements=1):
+        s = """{{"name": "{0}", """.format(name)
+        if num_elements == 1 or avro_type == "bytes":
+            t = "\"{0}\"".format(avro_type)
+        else:
+            t = """{{"type":"array", "items":"{0}"}}""".format(avro_type)
+        s += """"type": [{0}, "null"]}}, """.format(t)
+        f = self._get_converter(avro_type, num_elements)
+        self.__columns[name] = f 
+        self.__schema += s + "\n"
+
+    def add_int_column(self, name, description):
+        """
+        Adds an int column to the Avro schema.
+        """
+        self.add_column_definition(name, description, "int")
+
+    def add_char_column(self, name, description):
+        """
+        Adds a char column to the Avro schema.
+        """
+        self.add_column_definition(name, description, "bytes")
+    
+    def add_float_column(self, name, description):
+        """
+        Adds a float column to the Avro schema.
+        """
+        self.add_column_definition(name, description, "float")
+
+
+    def add_column(self, prefix, line):
         """
         Adds a VCF column using the specified metadata line with the specified 
         name prefix to the specified table.
@@ -139,7 +335,7 @@ class VCFReader(object):
         name = d[ID]
         description = d[DESCRIPTION].strip(b"\"")
         number = d[NUMBER]
-        num_elements = wt.WT_VAR_1 
+        num_elements = VARIABLE_SIZE 
         try:
             # If we can parse it into a number, do so. If this fails than use
             # a variable number of elements.
@@ -148,36 +344,43 @@ class VCFReader(object):
             pass
         # We can also have negative num_elements to indicate variable column
         if num_elements < 0:
-            num_elements = wt.WT_VAR_1 
+            num_elements = VARIABLE_SIZE 
         st = d[TYPE]
         if st == INTEGER:
-            element_type = wt.WT_INT
+            element_type = "int" 
             element_size = 4
         elif st == FLOAT: 
-            element_type = wt.WT_FLOAT
+            element_type = "float"
             element_size = 4
         elif st == FLAG: 
-            element_type = wt.WT_UINT
+            element_type = "int" # TODO change to boolean
             element_size = 1
             num_elements = 1
         elif st == CHARACTER: 
-            element_type = wt.WT_CHAR
+            element_type = "bytes" 
             element_size = 1
         elif st == STRING: 
-            num_elements = wt.WT_VAR_1 
-            element_type = wt.WT_CHAR
+            num_elements = VARIABLE_SIZE 
+            element_type = "bytes" 
             element_size = 1
         else:
             raise ValueError("Unknown VCF type:", st)
         
-        table.add_column(prefix + COLUMN_SEPARATOR + name,  description, 
-                element_type, element_size, num_elements)
+        self.add_column_definition(prefix + COLUMN_SEPARATOR + name, 
+                description, element_type, num_elements)
 
-    def generate_schema(self, table):
+    def generate_schema(self):
         """
-        Reads the header from the specified VCF file and returns a Table 
-        with the correct columns.
+        Reads the header from the specified VCF file and returns an 
+        avro schema in JSON format.
         """
+        self.__schema = """
+        {"namespace":"vcf.avro",
+         "type":"record",
+         "name":"VCF",
+         "fields": [
+        """
+        self.__columns = {}
         info_descriptions = []
         genotype_descriptions = []
         
@@ -191,20 +394,23 @@ class VCFReader(object):
                 genotype_descriptions.append(s)
 
         # Add the fixed columns
-        table.add_id_column(5)
-        table.add_char_column(CHROM_NAME, CHROM_DESCRIPTION)
-        table.add_uint_column(POS_NAME, POS_DESCRIPTION, 5)
-        table.add_char_column(ID_NAME, ID_DESCRIPTION)
-        table.add_char_column(REF_NAME, REF_DESCRIPTION)
-        table.add_char_column(ALT_NAME, ALT_DESCRIPTION)
-        table.add_float_column(QUAL_NAME, QUAL_DESCRIPTION, 4)
-        table.add_char_column(FILTER_NAME, FILTER_DESCRIPTION)
-
+        self.add_char_column(CHROM_NAME, CHROM_DESCRIPTION)
+        self.add_int_column(POS_NAME, POS_DESCRIPTION)
+        self.add_char_column(ID_NAME, ID_DESCRIPTION)
+        self.add_char_column(REF_NAME, REF_DESCRIPTION)
+        self.add_char_column(ALT_NAME, ALT_DESCRIPTION)
+        self.add_float_column(QUAL_NAME, QUAL_DESCRIPTION)
+        self.add_char_column(FILTER_NAME, FILTER_DESCRIPTION)
+        
         for s in info_descriptions:
-            self.add_column(table, INFO_NAME, s)
+            self.add_column(INFO_NAME, s)
         for genotype in self.__genotypes:
             for s in genotype_descriptions: 
-                self.add_column(table, genotype, s) 
+                self.add_column(genotype, s) 
+        # Remove the last ','
+        self.__schema = self.__schema.rstrip("\n ,")
+        self.__schema += "]}"
+        return self.__schema, self.__columns
 
     def read_header(self):
         """
@@ -224,7 +430,7 @@ class VCFReader(object):
         dictionary mapping column positions to their encoded string values.
         """
         # First we construct the mappings from the various parts of the 
-        # VCF row to the corresponding column index in the wormtable
+        # VCF row to the corresponding column name in the Avro schema 
         num_columns = len(table_columns) 
         all_fixed_columns = VCF_FIXED_COLUMNS 
         fixed_columns = []
@@ -232,38 +438,32 @@ class VCFReader(object):
         for j in range(len(all_fixed_columns)):
             name = all_fixed_columns[j]
             if name in table_columns:
-                fixed_columns.append((j, table_columns[name]))
+                fixed_columns.append((j, name))
         info_columns = {}
         genotype_columns = [{} for g in self.__genotypes]
-        for k, v in table_columns.items(): 
-            if COLUMN_SEPARATOR in k and v != 0:
+        for k in table_columns: 
+            if COLUMN_SEPARATOR in k:
                 split = k.split(COLUMN_SEPARATOR)
                 if split[0] == INFO:
                     name = COLUMN_SEPARATOR.join(split[1:])
-                    info_columns[name] = v 
+                    info_columns[name] = k 
                 else:
                     g = COLUMN_SEPARATOR.join(split[:-1])
                     name = split[-1]
                     index = self.__genotypes.index(g)
-                    genotype_columns[index][name] = v 
+                    genotype_columns[index][name] = k 
         ref_index = 3
         alt_index = 4
         # Now we are ready to process the file.
         update_rows = self.get_progress_update_rows()
         num_rows = 0
         for s in self.get_input_file():
-            row = [None for j in range(num_columns)] 
+            row = {} 
             l = s.split()
             # Read in the fixed columns
             for vcf_index, wt_index in fixed_columns:
                 if l[vcf_index] != MISSING_VALUE:
                     row[wt_index] = l[vcf_index]
-                    if vcf_index in (ref_index, alt_index) and self.__truncate:
-                        # truncate the REF/ALT column if necessary; this is a 
-                        # temporary workaround until more sophisticated 
-                        # truncation on a per column basis is implemented.
-                        if len(l[vcf_index]) > 254:
-                            row[wt_index] = l[vcf_index][:253] + b'+'
             # Now process the info columns.
             for mapping in l[7].split(b";"):
                 tokens = mapping.split(b"=")
@@ -293,28 +493,25 @@ class VCFReader(object):
                                 if tok != MISSING_VALUE and tok != b".,.":
                                     row[col] = tok 
                     j += 1
-            yield row
+            d = {}
+            """
+            for k  in table_columns:
+                if k not in row:
+                    print("Column", k, "not found")
+                    row[k] = "0"
+            """
+            for k, v in row.items():
+                f = table_columns[k]
+                if f is None:
+                    d[k] = v
+                else:
+                    d[k] = f(v)
+            yield d
             num_rows += 1
             if num_rows % update_rows == 0:
                 self.update_progress()
         self.finish_progress()
 
-
-class VCFWriter(object):
-    """
-    Class that writes VCF rows to a wormtable.
-    """
-    def __init__(self, table):
-        self.__table = table
-        self.__table.read_metadata()
-        self.__table.open("w")
-    
-    def append(self, row):
-        self.__table.append_encoded(row)
-
-    def close(self):
-        self.__table.close()
-    
 
 class ProgramRunner(object):
     """
@@ -347,29 +544,21 @@ class ProgramRunner(object):
         """
         Reads the header of the input VCF and generates a schema file.
         """
-        fd, schema_file = tempfile.mkstemp(suffix=".xml", prefix="vcf2wt_")
-        self.__tmp_files.append(schema_file)
-        os.close(fd)
-        tmpdir = tempfile.mkdtemp(suffix=".wt", prefix="vcf2wt_")
-        self.__tmp_dirs.append(tmpdir)
-        table = wt.Table(tmpdir)
-        self.__reader.generate_schema(table)
-        table.write_schema(schema_file)
-        self.__schema = schema_file
+        self.__schema, columns = self.__reader.generate_schema()
+        self.__column_map = columns
+        #with open("schema.json", "w") as f:
+        #    f.write(self.__schema)
+        #with open("schema.json", "r") as f:
+        #    self.__schema = f.read()
 
     def create_table(self):
         """
         Creates the table and reads the column information for the VCF reader.
         """
-        os.mkdir(self.__destination)
-        self.__table = wt.Table(self.__destination)
-        self.__table.read_schema(self.__schema)
-        self.__table.set_db_cache_size(self.__db_cache_size)
-        self.__table.open("w")
-        self.__column_map = {}
-        for c in self.__table.columns():
-            self.__column_map[c.get_name().encode()] = c.get_position()
-        self.__table.close()
+        schema = avro.schema.parse(self.__schema)
+        self.__output_file = open(self.__destination, "w")
+        self.__writer = avro.datafile.DataFileWriter(self.__output_file, 
+                avro.io.DatumWriter(), schema)
 
     def write_table(self):
         """
@@ -378,7 +567,6 @@ class ProgramRunner(object):
         """
         self.__reader.set_progress(self.__progress)
         self.__reader.set_truncate_REF_ALT(self.__truncate)
-        self.__writer = VCFWriter(self.__table)
         for r in self.__reader.rows(self.__column_map):
             self.__writer.append(r) 
         self.__reader.close()
@@ -395,10 +583,7 @@ class ProgramRunner(object):
         
         if os.path.exists(self.__destination):
             if self.__force:
-                if os.path.isdir(self.__destination):
-                    shutil.rmtree(self.__destination)
-                else:
-                    os.unlink(self.__destination)
+                os.unlink(self.__destination)
             else:
                 s = "'{0}' exists; use -f to overwrite".format(self.__destination)
                 self.error(s)
