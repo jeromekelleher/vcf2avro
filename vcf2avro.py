@@ -76,7 +76,7 @@ a call is made at this position. Otherwise, if the site has not passed all \
 filters, a semicolon-separated list of codes for filters that fail. """
 
 # char used to seperate VCF columns from their prefix, e.g INFO.AF
-COLUMN_SEPARATOR = b"."
+COLUMN_SEPARATOR = b"_"
 
 # Special values in VCF
 MISSING_VALUE = b"."
@@ -558,7 +558,7 @@ class ProgramRunner(object):
         schema = avro.schema.parse(self.__schema)
         self.__output_file = open(self.__destination, "w")
         self.__writer = avro.datafile.DataFileWriter(self.__output_file, 
-                avro.io.DatumWriter(), schema)
+                avro.io.DatumWriter(), schema, codec="deflate")
 
     def write_table(self):
         """
