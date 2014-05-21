@@ -33,6 +33,7 @@ from __future__ import division
 
 import os
 import sys
+import gzip
 import time
 import shutil 
 import argparse
@@ -558,7 +559,7 @@ class ProgramRunner(object):
         schema = avro.schema.parse(self.__schema)
         self.__output_file = open(self.__destination, "w")
         self.__writer = avro.datafile.DataFileWriter(self.__output_file, 
-                avro.io.DatumWriter(), schema, codec="deflate")
+                avro.io.DatumWriter(), schema) #, codec="deflate")
 
     def write_table(self):
         """
