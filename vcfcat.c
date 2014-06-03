@@ -34,7 +34,7 @@ fatal_error(char *msg, ...)
     exit(EXIT_FAILURE);
 }
 
-/* for convenience until we change the avro type to string */
+/* For convenience until we change the avro type to string */
 #define MAX_STRING 8192
 
 /* 
